@@ -1,0 +1,18 @@
+{
+  "name": "gsb120-streambuf",
+  "version": "0.0.0",
+  "private": true,
+  "description": "带背压的字节缓冲（Node.js 22，ESM，零第三方依赖）",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./src/streambuf.js",
+  "exports": {
+    ".": "./src/streambuf.js"
+  },
+  "scripts": {
+    "check": "node check/check.mjs",
+    "test": "node --test"
+  }
+}
