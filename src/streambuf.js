@@ -82,26 +82,20 @@ export class StreamBuf extends EventEmitter {
     this._queue.push(buf);
     this._buffered += buf.length;
 
-    const backpressured = this._buffered >= this._highWaterMark;
-    if (backpressured) {
+    const reachedHighWaterMark = this._buffered >= this._highWaterMark;
+    if (reachedHighWaterMark) {
       this._backpressured = true;
     }
 
     this._flush();
-    return !backpressured;
+    return !reachedHighWaterMark;
   }
 
   /** 声明写完；缓冲里的数据全部交给 `onData` 之后再派发 `finish`。 */
   end() {
     if (this._ended) return;
     this._ended = true;
-
-    while (this._queue.length > 0) {
-      const chunk = this._queue.shift();
-      this._buffered -= chunk.length;
-      this._onData(chunk);
-    }
-    this._finish();
+    this._flush();
   }
 
   _finish() {
@@ -116,26 +110,37 @@ export class StreamBuf extends EventEmitter {
     this.emit('error', error);
   }
 
+  /** 进入过背压态后，水位首次降到高水位以下时恰好派发一次 drain。 */
   _maybeDrain() {
-    if (this._backpressured && this._buffered === 0) {
+    if (this._backpressured && this._buffered < this._highWaterMark) {
       this._backpressured = false;
       this.emit('drain');
     }
   }
 
+  /** 一块被消费者完整消费（同步返回 / Promise 落定）后才出队、扣水位。 */
+  _consumeHead(chunk) {
+    this._queue.shift();
+    this._buffered -= chunk.length;
+    this._maybeDrain();
+  }
+
+  /**
+   * 依次冲刷队首。正在等消费者 Promise 落定时挂起；
+   * 消费者抛错 / 拒绝时这一块仍留在缓冲里（不出队、不扣水位），并停止派发。
+   */
   _flush() {
     if (this._flushing || this._awaiting || this._errored) return;
     this._flushing = true;
     try {
       while (this._queue.length > 0) {
-        const chunk = this._queue.shift();
+        const chunk = this._queue[0];
         let result;
         try {
           result = this._onData(chunk);
         } catch (error) {
-          this._buffered -= chunk.length;
           this._fail(error);
-          continue;
+          return;
         }
 
         if (isThenable(result)) {
@@ -143,7 +148,7 @@ export class StreamBuf extends EventEmitter {
           result.then(
             () => {
               this._awaiting = false;
-              this._maybeDrain();
+              this._consumeHead(chunk);
               this._flush();
             },
             (error) => {
@@ -154,11 +159,10 @@ export class StreamBuf extends EventEmitter {
           return;
         }
 
-        this._buffered -= chunk.length;
-        this._maybeDrain();
+        this._consumeHead(chunk);
       }
 
-      if (this._ended && !this._finished) {
+      if (this._ended && !this._finished && !this._errored) {
         this._finish();
       }
     } finally {
