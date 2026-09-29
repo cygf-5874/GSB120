@@ -46,12 +46,13 @@ export class StreamBuf extends EventEmitter {
     this._highWaterMark = highWaterMark;
     this._onData = options.onData;
     this._queue = [];
+    // 已写入但消费者还没消费完的字节数（含已交给 onData、仍在等待其 Promise 的块）。
     this._buffered = 0;
     this._ended = false;
     this._finished = false;
     this._errored = false;
     this._backpressured = false;
-    this._flushing = false;
+    // 有一块已交给消费者、正在等待它的 Promise 落定。
     this._awaiting = false;
   }
 
@@ -82,30 +83,26 @@ export class StreamBuf extends EventEmitter {
     this._queue.push(buf);
     this._buffered += buf.length;
 
-    const backpressured = this._buffered >= this._highWaterMark;
-    if (backpressured) {
+    // 判据取“把 chunk 放进缓冲之后、冲刷之前”这一刻（在途块仍计入），
+    // 与同步消费者是否立刻消费完无关。
+    const reachedHighWaterMark = this._buffered >= this._highWaterMark;
+    if (reachedHighWaterMark) {
       this._backpressured = true;
     }
 
     this._flush();
-    return !backpressured;
+    return !reachedHighWaterMark;
   }
 
   /** 声明写完；缓冲里的数据全部交给 `onData` 之后再派发 `finish`。 */
   end() {
     if (this._ended) return;
     this._ended = true;
-
-    while (this._queue.length > 0) {
-      const chunk = this._queue.shift();
-      this._buffered -= chunk.length;
-      this._onData(chunk);
-    }
-    this._finish();
+    this._flush();
   }
 
   _finish() {
-    if (this._finished) return;
+    if (this._finished || this._errored) return;
     this._finished = true;
     this.emit('finish');
   }
@@ -116,53 +113,62 @@ export class StreamBuf extends EventEmitter {
     this.emit('error', error);
   }
 
+  /**
+   * 背压态下，水位首次降到高水位以下时补一次 drain（恰一次）。
+   * 此刻未消费完的块（含在途块）仍计入 _buffered。
+   */
   _maybeDrain() {
-    if (this._backpressured && this._buffered === 0) {
+    if (this._backpressured && this._buffered < this._highWaterMark) {
       this._backpressured = false;
       this.emit('drain');
     }
   }
 
+  /**
+   * 按序把队首交给消费者。一块被完整消费（同步返回 / Promise 落定）之后
+   * 才出队、才从 _buffered 扣除；抛错或拒绝时这块原样留在队首并停止冲刷。
+   */
   _flush() {
-    if (this._flushing || this._awaiting || this._errored) return;
-    this._flushing = true;
-    try {
-      while (this._queue.length > 0) {
-        const chunk = this._queue.shift();
-        let result;
-        try {
-          result = this._onData(chunk);
-        } catch (error) {
-          this._buffered -= chunk.length;
-          this._fail(error);
-          continue;
-        }
+    if (this._awaiting || this._errored) return;
 
-        if (isThenable(result)) {
-          this._awaiting = true;
-          result.then(
-            () => {
-              this._awaiting = false;
-              this._maybeDrain();
-              this._flush();
-            },
-            (error) => {
-              this._awaiting = false;
-              this._fail(error);
-            },
-          );
-          return;
-        }
+    while (this._queue.length > 0) {
+      const chunk = this._queue[0];
 
-        this._buffered -= chunk.length;
-        this._maybeDrain();
+      let result;
+      try {
+        result = this._onData(chunk);
+      } catch (error) {
+        // 消费失败：这块没被消费，必须仍留在缓冲里，且不再派发后续 data。
+        this._fail(error);
+        return;
       }
 
-      if (this._ended && !this._finished) {
-        this._finish();
+      if (isThenable(result)) {
+        this._awaiting = true;
+        Promise.resolve(result).then(
+          () => {
+            this._awaiting = false;
+            this._queue.shift();
+            this._buffered -= chunk.length;
+            this._maybeDrain();
+            this._flush();
+          },
+          (error) => {
+            this._awaiting = false;
+            // 拒绝：这块仍留在队首，不丢弃。
+            this._fail(error);
+          },
+        );
+        return;
       }
-    } finally {
-      this._flushing = false;
+
+      this._queue.shift();
+      this._buffered -= chunk.length;
+      this._maybeDrain();
+    }
+
+    if (this._ended) {
+      this._finish();
     }
   }
 }
